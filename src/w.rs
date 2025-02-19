@@ -1,7 +1,7 @@
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
-use std::fmt;
 use std::result;
 
 trait Union {
@@ -11,8 +11,9 @@ trait Union {
 /// Implement union for HashMap such that the value in `self` is used over the value in `other` in
 /// the event of a collision.
 impl<K, V> Union for HashMap<K, V>
-    where K: Clone + Eq + Hash,
-          V: Clone
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
 {
     fn union(&self, other: &Self) -> Self {
         let mut res = self.clone();
@@ -25,17 +26,18 @@ impl<K, V> Union for HashMap<K, V>
 
 // Define our error monad
 pub type Result<T> = result::Result<T, Error>;
-pub struct Error {
-    msg: String,
-}
-impl Error {
-    fn new(msg: String) -> Error {
-        Error { msg: msg }
-    }
+pub enum Error {
+    OccursCheck(String),
+    UnificationFailure(String),
+    UnboundVariable(String),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.msg)
+        match self {
+            Error::OccursCheck(msg) => write!(f, "occur check fails: {}", msg),
+            Error::UnificationFailure(msg) => write!(f, "types do not unify: {}", msg),
+            Error::UnboundVariable(msg) => write!(f, "unbound variable: {}", msg),
+        }
     }
 }
 
@@ -101,7 +103,7 @@ impl fmt::Display for Lit {
 
 /// A type variable represents a type that is not constrained.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TypeVar(usize);
+pub struct TypeVar(pub usize);
 
 impl fmt::Display for TypeVar {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -125,7 +127,6 @@ impl TypeVarGen {
     }
 }
 
-
 impl TypeVar {
     /// Attempt to bind a type variable to a type, returning an appropriate substitution.
     fn bind(&self, ty: &Type) -> Result<Subst> {
@@ -138,7 +139,7 @@ impl TypeVar {
 
         // The occurs check prevents illegal recursive types.
         if ty.ftv().contains(self) {
-            return Err(Error::new(format!("occur check fails: {} vs {}", self, ty)));
+            return Err(Error::OccursCheck(format!("{} vs {}", self, ty)));
         }
 
         let mut s = Subst::new();
@@ -156,7 +157,8 @@ trait Types {
 }
 
 impl<'a, T> Types for Vec<T>
-    where T: Types
+where
+    T: Types,
 {
     // The free type variables of a vector of types is the union of the free type variables of each
     // of the types in the vector.
@@ -171,7 +173,6 @@ impl<'a, T> Types for Vec<T>
         self.iter().map(|x| x.apply(s)).collect()
     }
 }
-
 
 /// A monotype representing a concrete type.
 #[derive(Clone, Debug)]
@@ -217,7 +218,7 @@ impl Type {
             }
 
             // Otherwise, the types cannot be unified.
-            (t1, t2) => Err(Error::new(format!("types do not unify: {} vs {}", t1, t2))),
+            (t1, t2) => Err(Error::UnificationFailure(format!("{} vs {}", t1, t2))),
         }
     }
 }
@@ -290,11 +291,8 @@ impl Polytype {
     /// variables and return the resulting type.
     fn instantiate(&self, tvg: &mut TypeVarGen) -> Type {
         let newvars = self.vars.iter().map(|_| Type::Var(tvg.next()));
-        self.ty.apply(&Subst(self.vars
-                                 .iter()
-                                 .cloned()
-                                 .zip(newvars)
-                                 .collect()))
+        self.ty
+            .apply(&Subst(self.vars.iter().cloned().zip(newvars).collect()))
     }
 }
 
@@ -323,9 +321,14 @@ impl Subst {
     /// To compose two substitutions, we apply self to each type in other and union the resulting
     /// substitution with self.
     fn compose(&self, other: &Subst) -> Subst {
-        Subst(self.union(&other.iter()
-                               .map(|(k, v)| (k.clone(), v.apply(self)))
-                               .collect()))
+        Subst(
+            self.union(
+                &other
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.apply(self)))
+                    .collect(),
+            ),
+        )
     }
 }
 
@@ -349,14 +352,15 @@ impl Types for TypeEnv {
     /// The free type variables of a type environment is the union of the free type variables of
     /// each polytype in the environment.
     fn ftv(&self) -> HashSet<TypeVar> {
-        self.values().map(|x| x.clone()).collect::<Vec<Polytype>>().ftv()
+        self.values()
+            .map(|x| x.clone())
+            .collect::<Vec<Polytype>>()
+            .ftv()
     }
 
     /// To apply a substitution, we just apply it to each polytype in the type environment.
     fn apply(&self, s: &Subst) -> TypeEnv {
-        TypeEnv(self.iter()
-                    .map(|(k, v)| (k.clone(), v.apply(s)))
-                    .collect())
+        TypeEnv(self.iter().map(|(k, v)| (k.clone(), v.apply(s))).collect())
     }
 }
 
@@ -382,18 +386,20 @@ impl TypeEnv {
             Exp::Var(ref v) => {
                 match self.get(v) {
                     Some(s) => Ok((Subst::new(), s.instantiate(tvg))),
-                    None => Err(Error::new(format!("unbound variable: {}", v))),
+                    None => Err(Error::UnboundVariable(format!("{}", v))),
                 }
             }
 
             // A literal is typed as it's primitive type.
             Exp::Lit(ref l) => {
-                Ok((Subst::new(),
+                Ok((
+                    Subst::new(),
                     match l {
-                    &Lit::Int(_) => Type::Int,
-                    &Lit::Bool(_) => Type::Bool,
-                    &Lit::Str(_) => Type::Str,
-                }))
+                        &Lit::Int(_) => Type::Int,
+                        &Lit::Bool(_) => Type::Bool,
+                        &Lit::Str(_) => Type::Str,
+                    },
+                ))
             }
 
             // An abstraction is typed by:
@@ -408,11 +414,13 @@ impl TypeEnv {
                 let tv = Type::Var(tvg.next());
                 let mut env = self.clone();
                 env.remove(n);
-                env.insert(n.clone(),
-                           Polytype {
-                               vars: Vec::new(),
-                               ty: tv.clone(),
-                           });
+                env.insert(
+                    n.clone(),
+                    Polytype {
+                        vars: Vec::new(),
+                        ty: tv.clone(),
+                    },
+                );
                 let (s1, t1) = try!(env.ti(e, tvg));
                 Ok((s1.clone(), Type::Fun(Box::new(tv.apply(&s1)), Box::new(t1))))
             }
@@ -428,7 +436,9 @@ impl TypeEnv {
                 let (s1, t1) = try!(self.ti(e1, tvg));
                 let (s2, t2) = try!(self.apply(&s1).ti(e2, tvg));
                 let tv = Type::Var(tvg.next());
-                let s3 = try!(t1.apply(&s2).mgu(&Type::Fun(Box::new(t2), Box::new(tv.clone()))));
+                let s3 = try!(t1
+                    .apply(&s2)
+                    .mgu(&Type::Fun(Box::new(t2), Box::new(tv.clone()))));
                 Ok((s3.compose(&s2.compose(&s1)), tv.apply(&s3)))
             }
 
@@ -461,4 +471,3 @@ impl TypeEnv {
         Ok(t.apply(&s))
     }
 }
-
